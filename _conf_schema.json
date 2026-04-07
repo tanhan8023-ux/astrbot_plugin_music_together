@@ -1,0 +1,63 @@
+[
+  {
+    "key": "netease_api_url",
+    "type": "string",
+    "label": "NeteaseCloudMusicApi 地址",
+    "description": "自部署的 NeteaseCloudMusicApi 服务地址，例如 http://localhost:3000 或 http://你的服务器IP:3000",
+    "default": "http://localhost:3000"
+  },
+  {
+    "key": "netease_cookie",
+    "type": "string",
+    "label": "网易云登录 Cookie (可选)",
+    "description": "登录网易云后的 Cookie，填写后可获取 VIP 歌曲和每日推荐。获取方式: 浏览器登录网易云 -> F12 -> Application -> Cookies -> 复制 MUSIC_U 的值",
+    "default": ""
+  },
+  {
+    "key": "music_quality",
+    "type": "select",
+    "label": "音质",
+    "description": "歌曲播放音质 (需要对应VIP等级)",
+    "options": [
+      {"label": "标准", "value": "standard"},
+      {"label": "较高", "value": "higher"},
+      {"label": "极高", "value": "exhigh"},
+      {"label": "无损", "value": "lossless"},
+      {"label": "Hi-Res", "value": "hires"}
+    ],
+    "default": "standard"
+  },
+  {
+    "key": "default_source",
+    "type": "select",
+    "label": "默认音乐源",
+    "description": "搜索歌曲时默认使用的音乐平台",
+    "options": [
+      {"label": "全平台聚合", "value": "all"},
+      {"label": "网易云音乐 (推荐)", "value": "netease"},
+      {"label": "QQ音乐", "value": "qqmusic"},
+      {"label": "酷狗音乐", "value": "kugou"}
+    ],
+    "default": "netease"
+  },
+  {
+    "key": "send_mode",
+    "type": "select",
+    "label": "发送模式",
+    "description": "歌曲信息的发送方式",
+    "options": [
+      {"label": "文字+链接", "value": "text"},
+      {"label": "语音消息", "value": "voice"}
+    ],
+    "default": "text"
+  },
+  {
+    "key": "skip_vote_count",
+    "type": "number",
+    "label": "切歌投票数",
+    "description": "需要多少票才能切歌（默认2票）",
+    "default": 2,
+    "min": 1,
+    "max": 10
+  }
+]
