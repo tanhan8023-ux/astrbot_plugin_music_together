@@ -207,7 +207,8 @@ class MusicTogetherPlugin(Star):
         self._save_playlist(playlist)
 
         # 发送歌曲信息
-        yield from self._send_song(event, song)
+        async for result in self._send_song(event, song):
+            yield result
 
     @filter.command("加歌选", alias={"addselect"})
     async def cmd_add_from_search(self, event: AstrMessageEvent):
@@ -410,7 +411,8 @@ class MusicTogetherPlugin(Star):
                 # 发送歌曲
                 url = await self.music_api.get_play_url(next_song.song)
                 next_song.song.url = url
-                yield from self._send_song(event, next_song.song)
+                async for result in self._send_song(event, next_song.song):
+                    yield result
             else:
                 yield event.plain_result("歌单已播完，没有下一首了！")
         else:
@@ -847,8 +849,8 @@ class MusicTogetherPlugin(Star):
 
     # ==================== 辅助方法 ====================
 
-    def _send_song(self, event: AstrMessageEvent, song: Song):
-        """发送歌曲信息"""
+    async def _send_song(self, event: AstrMessageEvent, song: Song):
+        """发送歌曲信息（async 生成器）"""
         src_map = {"netease": "网易云", "qqmusic": "QQ音乐", "kugou": "酷狗"}
         source_name = src_map.get(song.source, song.source)
 
