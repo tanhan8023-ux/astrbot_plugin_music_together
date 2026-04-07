@@ -28,17 +28,8 @@ class MusicTogetherPlugin(Star):
 
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
-        # AstrBot 传入的 config 可能是 list（来自 _conf_schema.json），转成 dict
-        raw = config or {}
-        if isinstance(raw, list):
-            self.config = {}
-            for item in raw:
-                if isinstance(item, dict) and "key" in item:
-                    self.config[item["key"]] = item.get("value", item.get("default", ""))
-        elif isinstance(raw, dict):
-            self.config = raw
-        else:
-            self.config = {}
+        # AstrBot 传入的 config 是 AstrBotConfig (继承自 dict)，直接当 dict 用
+        self.config = dict(config) if config else {}
         self.music_api = MusicAPI(self.config)
 
         # 数据目录
