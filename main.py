@@ -587,11 +587,8 @@ class MusicTogetherPlugin(Star):
     # ==================== 网易云账号绑定 ====================
 
     @filter.command("绑定网易云", alias={"bind_netease", "绑定cookie"})
-    async def cmd_bind_netease(self, event: AstrMessageEvent):
+    async def cmd_bind_netease(self, event: AstrMessageEvent, cookie: str = ""):
         """绑定网易云音乐账号cookie，绑定后AI可以感知你在网易云听的歌"""
-        # 从消息中提取cookie：尝试多种方式获取
-        cookie = event.message_str.strip() if event.message_str else ""
-
         if not cookie:
             yield event.plain_result(
                 "请提供你的网易云cookie，格式:\n"
@@ -608,15 +605,6 @@ class MusicTogetherPlugin(Star):
             return
 
         user_id = event.get_sender_id() or ""
-
-        # 清理cookie：去掉可能残留的命令名
-        for prefix in ["绑定网易云", "bind_netease", "绑定cookie"]:
-            if cookie.startswith(prefix):
-                cookie = cookie[len(prefix):].strip()
-
-        if not cookie:
-            yield event.plain_result("cookie不能为空，请在命令后面粘贴你的MUSIC_U值。")
-            return
 
         # 自动补全cookie格式
         if "MUSIC_U" not in cookie:
