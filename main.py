@@ -5,6 +5,7 @@
 import os
 import logging
 import random
+import datetime
 from typing import Dict
 
 from astrbot.api.star import Context, Star
@@ -205,6 +206,7 @@ class MusicTogetherPlugin(Star):
         playlist = self._get_playlist(session_id)
         pos = playlist.add_song(song, user_id, user_name)
         playlist.current_index = pos - 1
+        playlist.start_playing()
         self._save_playlist(playlist)
 
         # 发送歌曲信息
@@ -850,8 +852,8 @@ class MusicTogetherPlugin(Star):
 
     @filter.llm_tool()
     async def get_current_playing(self, event: AstrMessageEvent):
-        """当用户提到"这首歌"、"现在听的"、"当前播放"或聊到正在听的音乐时调用此工具。
-        获取当前会话正在播放的歌曲详细信息，包括歌名、歌手、专辑、时长、歌词片段、点歌人等。
+        """当用户提到"这首歌"、"现在听的"、"当前播放"、"听到哪了"、"现在什么歌词"或聊到正在听的音乐时调用此工具。
+        获取当前会话正在播放的歌曲详细信息，包括实时播放进度、当前正在唱的歌词行、歌名、歌手等。
         """
         session_id = event.unified_msg_origin or ""
         playlist = self._get_playlist(session_id)
@@ -872,9 +874,27 @@ class MusicTogetherPlugin(Star):
             lines.append(f"专辑: {song.album}")
         if song.duration > 0:
             m, s = divmod(song.duration, 60)
-            lines.append(f"时长: {m}分{s:02d}秒")
+            lines.append(f"总时长: {m}分{s:02d}秒")
         lines.append(f"来源: {src_map.get(song.source, song.source)}")
         lines.append(f"点歌人: {current.added_by_name}")
+
+        # 播放进度信息
+        elapsed = current.playback_seconds
+        if current.started_at > 0:
+            em, es = divmod(int(elapsed), 60)
+            if song.duration > 0:
+                dm, ds = divmod(song.duration, 60)
+                progress_pct = min(100, int(elapsed / song.duration * 100))
+                lines.append(f"播放进度: {em}:{es:02d} / {dm}:{ds:02d} ({progress_pct}%)")
+                if current.is_finished:
+                    lines.append("状态: 已播放完毕")
+                else:
+                    lines.append("状态: 正在播放中")
+            else:
+                lines.append(f"已播放: {em}:{es:02d}")
+                lines.append("状态: 正在播放中")
+        else:
+            lines.append("状态: 已添加到歌单，尚未开始播放")
 
         # 歌单位置信息
         pos = playlist.current_index + 1
@@ -885,20 +905,30 @@ class MusicTogetherPlugin(Star):
             next_entry = playlist.entries[playlist.current_index + 1]
             lines.append(f"下一首: {next_entry.song.title} - {next_entry.song.artist}")
 
-        # 尝试获取歌词片段
+        # 获取歌词并定位到当前播放位置
         try:
-            lyric = await self.music_api.get_lyric(song)
-            if lyric:
-                lyric_lines = []
-                for line in lyric.split("\n"):
-                    text = line.strip()
-                    while text.startswith("[") and "]" in text:
-                        text = text[text.index("]") + 1:]
-                    text = text.strip()
-                    if text:
-                        lyric_lines.append(text)
-                if lyric_lines:
-                    lines.append(f"\n歌词片段:\n" + "\n".join(lyric_lines[:10]))
+            lyric_raw = await self.music_api.get_lyric(song)
+            if lyric_raw:
+                parsed_lrc = MusicAPI.parse_lrc(lyric_raw)
+                if parsed_lrc and current.started_at > 0:
+                    # 有时间标签的歌词，精确定位当前行
+                    lyric_info = MusicAPI.get_lyric_at_position(parsed_lrc, elapsed, context=3)
+                    if lyric_info["current_line"]:
+                        lines.append(f"\n当前正在唱的歌词: 「{lyric_info['current_line']}」")
+                        lines.append(f"\n歌词上下文 (>> 标记当前行):")
+                        lines.append(lyric_info["progress_text"])
+                elif parsed_lrc:
+                    # 有歌词但没有播放进度，显示开头
+                    lines.append(f"\n歌词开头:")
+                    for _, text in parsed_lrc[:6]:
+                        lines.append(f"  {text}")
+                else:
+                    # 没有时间标签的纯文本歌词
+                    plain_lines = [l.strip() for l in lyric_raw.split("\n") if l.strip()]
+                    if plain_lines:
+                        lines.append(f"\n歌词片段:")
+                        for l in plain_lines[:8]:
+                            lines.append(f"  {l}")
         except Exception:
             pass
 
@@ -981,6 +1011,41 @@ class MusicTogetherPlugin(Star):
             remaining = len(playlist.entries) - playlist.current_index - 1
             lines.append(f"剩余待播: {remaining}首")
 
+        return "\n".join(lines)
+
+    @filter.llm_tool()
+    async def get_netease_recent_plays(self, event: AstrMessageEvent):
+        """当用户提到自己在网易云音乐上听了什么、最近在听什么歌、或者想知道自己网易云的播放记录时调用此工具。
+        获取用户在网易云音乐上的真实最近播放记录（需要配置网易云cookie）。
+        """
+        recent = await self.music_api.get_recent_songs(limit=10)
+        if not recent:
+            if not self.music_api.netease_cookie:
+                return "未配置网易云音乐登录cookie，无法获取真实播放记录。请在插件配置中填写 netease_cookie。"
+            return "获取网易云最近播放记录失败，可能是cookie已过期或网络问题。"
+
+        # 缓存搜索结果以便用户可以选歌
+        session_id = event.unified_msg_origin or ""
+        user_id = event.get_sender_id() or ""
+        if session_id not in _search_cache:
+            _search_cache[session_id] = {}
+        _search_cache[session_id][user_id] = [item["song"] for item in recent]
+
+        lines = ["用户在网易云音乐上的最近播放记录:"]
+        for i, item in enumerate(recent, 1):
+            song = item["song"]
+            play_time = item.get("play_time", 0)
+            time_str = ""
+            if play_time:
+                dt = datetime.datetime.fromtimestamp(play_time / 1000)
+                time_str = f" ({dt.strftime('%m-%d %H:%M')})"
+            duration_str = ""
+            if song.duration > 0:
+                m, s = divmod(song.duration, 60)
+                duration_str = f" [{m}:{s:02d}]"
+            lines.append(f"  {i}. {song.title} - {song.artist}{duration_str}{time_str}")
+
+        lines.append("\n用户可以回复 /选歌 <序号> 来播放这些歌曲")
         return "\n".join(lines)
 
     # ==================== 辅助方法 ====================

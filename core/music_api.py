@@ -2,10 +2,11 @@
 多平台音乐搜索引擎
 优先使用 NeteaseCloudMusicApi (自部署)，QQ音乐/酷狗使用公开接口作为补充
 """
+import re
 import logging
 import aiohttp
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from .models import Song
 
 logger = logging.getLogger("astrbot_plugin_music_together")
@@ -456,3 +457,154 @@ class MusicAPI:
                 return resp.status == 200
         except Exception:
             return False
+
+    # ================================================================
+    #  网易云用户最近播放记录
+    # ================================================================
+
+    async def get_recent_songs(self, limit: int = 10) -> List[dict]:
+        """获取网易云用户最近播放的歌曲 (需要登录cookie)
+
+        返回 List[dict]，每项包含 song (Song对象) 和 playTime (播放时间戳ms)
+        """
+        if not self.netease_cookie:
+            logger.debug("未配置cookie，无法获取最近播放记录")
+            return []
+        results = []
+        try:
+            session = await self._get_session()
+            url = f"{self.netease_api}/record/recent/song"
+            params = {"limit": limit, **self._netease_params()}
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("code") == 200:
+                        for item in data.get("data", {}).get("list", [])[:limit]:
+                            song_data = item.get("data", {})
+                            artists = "/".join(
+                                [a["name"] for a in song_data.get("ar", [])]
+                            )
+                            album_info = song_data.get("al", {})
+                            song = Song(
+                                title=song_data.get("name", ""),
+                                artist=artists,
+                                album=album_info.get("name", ""),
+                                duration=song_data.get("dt", 0) // 1000,
+                                song_id=str(song_data.get("id", "")),
+                                source="netease",
+                                cover_url=album_info.get("picUrl", ""),
+                            )
+                            results.append({
+                                "song": song,
+                                "play_time": item.get("playTime", 0),
+                            })
+        except aiohttp.ClientConnectorError:
+            logger.error("无法连接 NeteaseCloudMusicApi，获取最近播放失败")
+        except Exception as e:
+            logger.warning(f"获取最近播放记录失败: {e}")
+        return results
+
+    # ================================================================
+    #  LRC 歌词解析工具
+    # ================================================================
+
+    @staticmethod
+    def parse_lrc(lrc_text: str) -> List[Tuple[float, str]]:
+        """解析 LRC 歌词，返回 [(秒数, 歌词文本), ...] 按时间排序
+
+        支持格式: [mm:ss.xx] 歌词内容
+        """
+        if not lrc_text:
+            return []
+        pattern = re.compile(r"\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]")
+        result = []
+        for line in lrc_text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            # 一行可能有多个时间标签 [00:01.00][00:15.00]歌词
+            timestamps = []
+            text = line
+            while True:
+                m = pattern.match(text)
+                if not m:
+                    break
+                minutes = int(m.group(1))
+                seconds = int(m.group(2))
+                ms_str = m.group(3) or "0"
+                # 统一为毫秒
+                if len(ms_str) == 2:
+                    ms = int(ms_str) * 10
+                elif len(ms_str) == 1:
+                    ms = int(ms_str) * 100
+                else:
+                    ms = int(ms_str)
+                total_seconds = minutes * 60 + seconds + ms / 1000.0
+                timestamps.append(total_seconds)
+                text = text[m.end():]
+            text = text.strip()
+            if text and timestamps:
+                for ts in timestamps:
+                    result.append((ts, text))
+        result.sort(key=lambda x: x[0])
+        return result
+
+    @staticmethod
+    def get_lyric_at_position(parsed_lrc: List[Tuple[float, str]], position_sec: float,
+                              context: int = 2) -> dict:
+        """根据播放进度获取当前歌词行及上下文
+
+        Args:
+            parsed_lrc: parse_lrc() 的返回值
+            position_sec: 当前播放位置（秒）
+            context: 上下文行数（前后各几行）
+
+        Returns:
+            dict: {
+                "current_line": str,       # 当前歌词行
+                "current_index": int,      # 当前行索引
+                "context_before": [str],   # 前几行歌词
+                "context_after": [str],    # 后几行歌词
+                "progress_text": str,      # 格式化的进度文本
+            }
+        """
+        if not parsed_lrc:
+            return {
+                "current_line": "",
+                "current_index": -1,
+                "context_before": [],
+                "context_after": [],
+                "progress_text": "",
+            }
+
+        # 找到当前播放位置对应的歌词行
+        current_idx = 0
+        for i, (ts, _) in enumerate(parsed_lrc):
+            if ts <= position_sec:
+                current_idx = i
+            else:
+                break
+
+        current_line = parsed_lrc[current_idx][1]
+
+        # 上下文
+        before_start = max(0, current_idx - context)
+        after_end = min(len(parsed_lrc), current_idx + context + 1)
+
+        context_before = [parsed_lrc[i][1] for i in range(before_start, current_idx)]
+        context_after = [parsed_lrc[i][1] for i in range(current_idx + 1, after_end)]
+
+        # 格式化进度文本
+        lines = []
+        for i in range(before_start, after_end):
+            prefix = ">> " if i == current_idx else "   "
+            lines.append(f"{prefix}{parsed_lrc[i][1]}")
+        progress_text = "\n".join(lines)
+
+        return {
+            "current_line": current_line,
+            "current_index": current_idx,
+            "context_before": context_before,
+            "context_after": context_after,
+            "progress_text": progress_text,
+        }

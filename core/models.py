@@ -52,11 +52,30 @@ class PlaylistEntry:
     added_by: str = ""  # 添加者ID
     added_by_name: str = ""  # 添加者昵称
     added_at: float = 0.0  # 添加时间戳
+    started_at: float = 0.0  # 开始播放时间戳 (0 表示未播放)
     votes: list = field(default_factory=list)  # 投票用户ID列表
 
     @property
     def vote_count(self) -> int:
         return len(self.votes)
+
+    @property
+    def playback_seconds(self) -> float:
+        """当前已播放秒数 (从 started_at 算起)"""
+        if self.started_at <= 0:
+            return 0.0
+        elapsed = time.time() - self.started_at
+        # 不超过歌曲总时长
+        if self.song.duration > 0:
+            return min(elapsed, self.song.duration)
+        return elapsed
+
+    @property
+    def is_finished(self) -> bool:
+        """歌曲是否已播放完毕"""
+        if self.started_at <= 0 or self.song.duration <= 0:
+            return False
+        return (time.time() - self.started_at) >= self.song.duration
 
     def to_dict(self) -> dict:
         return {
@@ -64,6 +83,7 @@ class PlaylistEntry:
             "added_by": self.added_by,
             "added_by_name": self.added_by_name,
             "added_at": self.added_at,
+            "started_at": self.started_at,
             "votes": self.votes,
         }
 
@@ -75,6 +95,7 @@ class PlaylistEntry:
             added_by=data.get("added_by", ""),
             added_by_name=data.get("added_by_name", ""),
             added_at=data.get("added_at", 0.0),
+            started_at=data.get("started_at", 0.0),
             votes=data.get("votes", []),
         )
 
@@ -104,10 +125,18 @@ class SharedPlaylist:
         self.entries.append(entry)
         return len(self.entries)
 
+    def start_playing(self):
+        """标记当前歌曲开始播放"""
+        current = self.current_song
+        if current and current.started_at <= 0:
+            current.started_at = time.time()
+
     def next_song(self) -> Optional[PlaylistEntry]:
         self.skip_votes.clear()
         if self.current_index < len(self.entries) - 1:
             self.current_index += 1
+            # 自动标记新歌开始播放
+            self.start_playing()
             return self.current_song
         return None
 
