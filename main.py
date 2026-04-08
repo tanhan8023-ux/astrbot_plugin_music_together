@@ -13,6 +13,11 @@ from astrbot.api.star import Context, Star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Plain, Record, Image
 
+try:
+    from astrbot.core.provider.entities import ProviderRequest
+except ImportError:
+    ProviderRequest = None
+
 from .core.models import Song, SharedPlaylist, UserData
 from .core.music_api import MusicAPI
 from .core.storage import Storage
@@ -840,6 +845,70 @@ class MusicTogetherPlugin(Star):
         lines.append("回复 /加歌选 <序号> 添加到歌单")
 
         yield event.plain_result("\n".join(lines))
+
+    # ==================== AI 上下文注入 ====================
+
+    @filter.on_llm_request()
+    async def inject_music_context(self, event: AstrMessageEvent, req=None):
+        """在 AI 生成回复前，自动注入用户当前听歌状态到系统提示中"""
+        if req is None or ProviderRequest is None:
+            return
+        try:
+            user_id = event.get_sender_id() or ""
+            cookie = await self._get_user_cookie(user_id)
+            if not cookie:
+                return
+
+            # 拉取网易云最近播放
+            recent = await self.music_api.get_recent_songs(limit=1, cookie=cookie)
+            if not recent:
+                return
+
+            item = recent[0]
+            song = item["song"]
+            play_time_ms = item.get("play_time", 0)
+
+            context_parts = [f"用户当前正在听的歌: {song.title} - {song.artist}"]
+            if song.album:
+                context_parts.append(f"专辑: {song.album}")
+            if song.duration > 0:
+                m, s = divmod(song.duration, 60)
+                context_parts.append(f"时长: {m}:{s:02d}")
+
+            # 估算播放进度
+            if play_time_ms > 0:
+                elapsed = _time.time() - play_time_ms / 1000.0
+                if elapsed < 600 and song.duration > 0:  # 10分钟内
+                    pos = elapsed % song.duration if elapsed > song.duration else elapsed
+                    pm, ps = divmod(int(pos), 60)
+                    dm, ds = divmod(song.duration, 60)
+                    pct = int(pos / song.duration * 100)
+                    context_parts.append(f"播放进度: 约{pm}:{ps:02d}/{dm}:{ds:02d} ({pct}%)")
+
+                    # 获取当前歌词行
+                    try:
+                        lyric_raw = await self.music_api.get_lyric(song)
+                        if lyric_raw:
+                            parsed = MusicAPI.parse_lrc(lyric_raw)
+                            if parsed:
+                                info = MusicAPI.get_lyric_at_position(parsed, pos, context=2)
+                                if info["current_line"]:
+                                    context_parts.append(f"当前歌词: 「{info['current_line']}」")
+                    except Exception:
+                        pass
+                elif elapsed >= 600:
+                    dt = datetime.datetime.fromtimestamp(play_time_ms / 1000)
+                    context_parts.append(f"(播放于 {dt.strftime('%H:%M')}, 可能已结束)")
+
+            music_context = "\n".join(context_parts)
+            req.system_prompt += (
+                f"\n\n<music_context>\n"
+                f"以下是用户当前的听歌状态(来自网易云音乐)，你可以在聊天中自然地提及:\n"
+                f"{music_context}\n"
+                f"</music_context>"
+            )
+        except Exception as e:
+            logger.debug(f"注入音乐上下文失败: {e}")
 
     # ==================== LLM Tool 集成 ====================
 
