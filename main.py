@@ -848,6 +848,141 @@ class MusicTogetherPlugin(Star):
 
         return f"「{song.title} - {song.artist}」歌词:\n" + "\n".join(lines[:20])
 
+    @filter.llm_tool()
+    async def get_current_playing(self, event: AstrMessageEvent):
+        """当用户提到"这首歌"、"现在听的"、"当前播放"或聊到正在听的音乐时调用此工具。
+        获取当前会话正在播放的歌曲详细信息，包括歌名、歌手、专辑、时长、歌词片段、点歌人等。
+        """
+        session_id = event.unified_msg_origin or ""
+        playlist = self._get_playlist(session_id)
+        current = playlist.current_song
+
+        if not current:
+            return "当前没有正在播放的歌曲。用户还没有点歌。"
+
+        song = current.song
+        src_map = {"netease": "网易云音乐", "qqmusic": "QQ音乐", "kugou": "酷狗音乐"}
+
+        lines = [
+            f"当前正在播放的歌曲信息:",
+            f"歌名: {song.title}",
+            f"歌手: {song.artist}",
+        ]
+        if song.album:
+            lines.append(f"专辑: {song.album}")
+        if song.duration > 0:
+            m, s = divmod(song.duration, 60)
+            lines.append(f"时长: {m}分{s:02d}秒")
+        lines.append(f"来源: {src_map.get(song.source, song.source)}")
+        lines.append(f"点歌人: {current.added_by_name}")
+
+        # 歌单位置信息
+        pos = playlist.current_index + 1
+        total = len(playlist.entries)
+        lines.append(f"歌单位置: 第{pos}首/共{total}首")
+
+        if playlist.current_index < total - 1:
+            next_entry = playlist.entries[playlist.current_index + 1]
+            lines.append(f"下一首: {next_entry.song.title} - {next_entry.song.artist}")
+
+        # 尝试获取歌词片段
+        try:
+            lyric = await self.music_api.get_lyric(song)
+            if lyric:
+                lyric_lines = []
+                for line in lyric.split("\n"):
+                    text = line.strip()
+                    while text.startswith("[") and "]" in text:
+                        text = text[text.index("]") + 1:]
+                    text = text.strip()
+                    if text:
+                        lyric_lines.append(text)
+                if lyric_lines:
+                    lines.append(f"\n歌词片段:\n" + "\n".join(lyric_lines[:10]))
+        except Exception:
+            pass
+
+        return "\n".join(lines)
+
+    @filter.llm_tool()
+    async def get_user_music_profile(self, event: AstrMessageEvent):
+        """当用户聊到自己的音乐喜好、听歌习惯，或者需要了解用户音乐口味来做推荐和聊天时调用此工具。
+        获取用户的听歌画像，包括最近播放、最常听的歌、收藏列表。
+        """
+        user_id = event.get_sender_id() or ""
+        user_data = self._get_user(user_id)
+
+        lines = [f"用户的音乐画像:"]
+
+        # 最近播放
+        if user_data.play_history:
+            recent = user_data.play_history[-5:]
+            recent.reverse()
+            lines.append("\n最近播放:")
+            for i, h in enumerate(recent, 1):
+                lines.append(f"  {i}. {h['title']} - {h['artist']}")
+        else:
+            lines.append("\n最近播放: 暂无播放记录")
+
+        # 最常听
+        top = user_data.get_top_songs(5)
+        if top:
+            lines.append("\n最常听的歌:")
+            for i, item in enumerate(top, 1):
+                s = item["song"]
+                lines.append(f"  {i}. {s['title']} - {s['artist']} (听了{item['count']}次)")
+
+        # 收藏
+        if user_data.favorites:
+            lines.append(f"\n收藏列表 (共{len(user_data.favorites)}首):")
+            for i, fav in enumerate(user_data.favorites[:5], 1):
+                lines.append(f"  {i}. {fav['title']} - {fav['artist']}")
+            if len(user_data.favorites) > 5:
+                lines.append(f"  ... 还有{len(user_data.favorites) - 5}首")
+        else:
+            lines.append("\n收藏列表: 暂无收藏")
+
+        # 总结听歌偏好
+        if top:
+            artists = set()
+            for item in top:
+                for a in item["song"]["artist"].split("/"):
+                    artists.add(a.strip())
+            if artists:
+                lines.append(f"\n常听歌手: {', '.join(list(artists)[:5])}")
+
+        return "\n".join(lines)
+
+    @filter.llm_tool()
+    async def get_playlist_info(self, event: AstrMessageEvent):
+        """当用户问到歌单、播放列表、接下来放什么歌、或者想了解当前群里的共享歌单时调用此工具。
+        获取当前会话的共享歌单信息。
+        """
+        session_id = event.unified_msg_origin or ""
+        playlist = self._get_playlist(session_id)
+
+        if not playlist.entries:
+            return "当前共享歌单为空，还没有人添加歌曲。"
+
+        lines = [f"当前共享歌单 (共{len(playlist.entries)}首):"]
+
+        for i, entry in enumerate(playlist.entries):
+            prefix = ">> " if i == playlist.current_index else "   "
+            playing = " [正在播放]" if i == playlist.current_index else ""
+            vote_str = f" [{entry.vote_count}票]" if entry.vote_count > 0 else ""
+            lines.append(
+                f"{prefix}{i + 1}. {entry.song.title} - {entry.song.artist}"
+                f"{playing}{vote_str} (by {entry.added_by_name})"
+            )
+
+        current = playlist.current_song
+        if current:
+            lines.append(f"\n正在播放: {current.song.title} - {current.song.artist}")
+            remaining = len(playlist.entries) - playlist.current_index - 1
+            lines.append(f"剩余待播: {remaining}首")
+
+        return "\n".join(lines)
+
     # ==================== 辅助方法 ====================
 
     async def _send_song(self, event: AstrMessageEvent, song: Song):
