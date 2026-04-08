@@ -128,6 +128,8 @@ class MusicTogetherPlugin(Star):
             "/推荐 - 根据历史推荐歌曲\n"
             "\n"
             "[ 系统 ]\n"
+            "/绑定网易云 <cookie> - 绑定网易云账号(AI可感知你听的歌)\n"
+            "/解绑网易云 - 解除绑定\n"
             "/音乐状态 - 查看API服务状态\n"
             "\n"
             "也可以直接和我聊音乐话题~"
@@ -237,7 +239,10 @@ class MusicTogetherPlugin(Star):
 
         song = cache[index]
         playlist = self._get_playlist(session_id)
+        is_first = len(playlist.entries) == 0
         pos = playlist.add_song(song, user_id, user_name)
+        if is_first:
+            playlist.start_playing()
         self._save_playlist(playlist)
 
         yield event.plain_result(
@@ -292,7 +297,11 @@ class MusicTogetherPlugin(Star):
 
         song = songs[0]
         playlist = self._get_playlist(session_id)
+        is_first = len(playlist.entries) == 0
         pos = playlist.add_song(song, user_id, user_name)
+        # 如果是歌单第一首歌，自动开始播放
+        if is_first:
+            playlist.start_playing()
         self._save_playlist(playlist)
 
         yield event.plain_result(
@@ -574,6 +583,59 @@ class MusicTogetherPlugin(Star):
 
         yield event.plain_result("\n".join(lines))
 
+    # ==================== 网易云账号绑定 ====================
+
+    @filter.command("绑定网易云", alias={"bind_netease", "绑定cookie"})
+    async def cmd_bind_netease(self, event: AstrMessageEvent):
+        """绑定网易云音乐账号cookie，绑定后AI可以感知你在网易云听的歌"""
+        cookie = event.message_str.strip()
+        if not cookie:
+            yield event.plain_result(
+                "请提供你的网易云cookie，例如:\n"
+                "/绑定网易云 MUSIC_U=xxxx\n"
+                "\n"
+                "获取方式:\n"
+                "1. 浏览器登录 music.163.com\n"
+                "2. F12打开开发者工具 -> Application -> Cookies\n"
+                "3. 复制 MUSIC_U 的值\n"
+                "\n"
+                "绑定后AI就能知道你在网易云正在听什么歌了！\n"
+                "建议私聊发送cookie，避免泄露。"
+            )
+            return
+
+        user_id = event.get_sender_id() or ""
+        user_data = self._get_user(user_id)
+        user_data.netease_cookie = cookie
+        self._save_user(user_data)
+
+        # 验证cookie是否有效
+        recent = await self.music_api.get_recent_songs(limit=1, cookie=cookie)
+        if recent:
+            song = recent[0]["song"]
+            yield event.plain_result(
+                f"绑定成功！已验证cookie有效。\n"
+                f"你最近听的歌: {song.title} - {song.artist}\n"
+                f"\n现在AI可以感知你在网易云听的歌了~"
+            )
+        else:
+            yield event.plain_result(
+                "已保存cookie，但无法验证是否有效（可能是cookie格式问题或API未连接）。\n"
+                "如果不生效，请检查cookie是否正确。"
+            )
+
+    @filter.command("解绑网易云", alias={"unbind_netease", "解绑cookie"})
+    async def cmd_unbind_netease(self, event: AstrMessageEvent):
+        """解除网易云音乐账号绑定"""
+        user_id = event.get_sender_id() or ""
+        user_data = self._get_user(user_id)
+        if user_data.netease_cookie:
+            user_data.netease_cookie = ""
+            self._save_user(user_data)
+            yield event.plain_result("已解除网易云账号绑定。")
+        else:
+            yield event.plain_result("你还没有绑定网易云账号。")
+
     # ==================== 个人功能 ====================
 
     @filter.command("收藏", alias={"fav", "favorite"})
@@ -850,80 +912,156 @@ class MusicTogetherPlugin(Star):
 
         return f"「{song.title} - {song.artist}」歌词:\n" + "\n".join(lines[:20])
 
+    async def _get_user_cookie(self, user_id: str) -> str:
+        """获取用户的网易云cookie（优先用户绑定的，其次全局配置的）"""
+        user_data = self._get_user(user_id)
+        return user_data.netease_cookie or self.music_api.netease_cookie
+
+    async def _fetch_netease_now_playing(self, cookie: str) -> dict:
+        """从网易云拉取用户最近播放的第一首歌，作为"当前在听的歌"
+
+        Returns:
+            dict: {"song": Song, "play_time": int(ms), "elapsed_estimate": float(秒)} 或空dict
+        """
+        if not cookie:
+            return {}
+        try:
+            recent = await self.music_api.get_recent_songs(limit=1, cookie=cookie)
+            if not recent:
+                return {}
+            item = recent[0]
+            song = item["song"]
+            play_time_ms = item.get("play_time", 0)
+            # 估算已播放时间：当前时间 - 播放记录时间
+            if play_time_ms > 0:
+                import time as _time
+                elapsed = _time.time() - play_time_ms / 1000.0
+                # 如果超过歌曲时长的2倍，说明这首歌早就听完了，不算"正在听"
+                if song.duration > 0 and elapsed > song.duration * 2:
+                    return {
+                        "song": song,
+                        "play_time": play_time_ms,
+                        "elapsed_estimate": song.duration,  # 已听完
+                        "is_stale": True,
+                    }
+                # 如果在合理范围内，估算当前进度
+                elapsed_in_song = min(elapsed, song.duration) if song.duration > 0 else elapsed
+                return {
+                    "song": song,
+                    "play_time": play_time_ms,
+                    "elapsed_estimate": max(0, elapsed_in_song),
+                    "is_stale": False,
+                }
+            return {"song": song, "play_time": 0, "elapsed_estimate": 0, "is_stale": True}
+        except Exception as e:
+            logger.debug(f"拉取网易云最近播放失败: {e}")
+            return {}
+
     @filter.llm_tool()
     async def get_current_playing(self, event: AstrMessageEvent):
-        """当用户提到"这首歌"、"现在听的"、"当前播放"、"听到哪了"、"现在什么歌词"或聊到正在听的音乐时调用此工具。
-        获取当前会话正在播放的歌曲详细信息，包括实时播放进度、当前正在唱的歌词行、歌名、歌手等。
+        """当用户提到"这首歌"、"现在听的"、"当前播放"、"听到哪了"、"现在什么歌词"、"我在听"或聊到正在听的音乐时调用此工具。
+        获取用户真实正在听的歌曲信息，包括实时播放进度、当前歌词行。
+        优先从用户绑定的网易云账号获取真实播放状态，也会参考插件内歌单。
         """
+        user_id = event.get_sender_id() or ""
         session_id = event.unified_msg_origin or ""
-        playlist = self._get_playlist(session_id)
-        current = playlist.current_song
+        cookie = await self._get_user_cookie(user_id)
 
-        if not current:
-            return "当前没有正在播放的歌曲。用户还没有点歌。"
+        lines = []
+        song = None
+        elapsed = 0.0
+        has_progress = False
+        source_desc = ""
 
-        song = current.song
-        src_map = {"netease": "网易云音乐", "qqmusic": "QQ音乐", "kugou": "酷狗音乐"}
+        # ===== 优先尝试从网易云获取真实播放状态 =====
+        netease_info = await self._fetch_netease_now_playing(cookie)
+        if netease_info and not netease_info.get("is_stale", True):
+            song = netease_info["song"]
+            elapsed = netease_info["elapsed_estimate"]
+            has_progress = True
+            source_desc = "来源: 网易云音乐 (真实播放)"
 
-        lines = [
-            f"当前正在播放的歌曲信息:",
-            f"歌名: {song.title}",
-            f"歌手: {song.artist}",
-        ]
+            play_time_ms = netease_info.get("play_time", 0)
+            if play_time_ms:
+                dt = datetime.datetime.fromtimestamp(play_time_ms / 1000)
+                source_desc += f"\n开始播放时间: {dt.strftime('%H:%M:%S')}"
+
+            lines.append("用户当前真实正在听的歌曲 (来自网易云音乐):")
+        elif netease_info and netease_info.get("is_stale"):
+            # 有记录但已过期，作为补充信息
+            stale_song = netease_info["song"]
+            play_time_ms = netease_info.get("play_time", 0)
+            time_str = ""
+            if play_time_ms:
+                dt = datetime.datetime.fromtimestamp(play_time_ms / 1000)
+                time_str = f" (播放于 {dt.strftime('%m-%d %H:%M')})"
+            lines.append(f"用户最近在网易云听过: {stale_song.title} - {stale_song.artist}{time_str}")
+            lines.append("")
+
+        # ===== 如果网易云没有实时数据，回退到插件歌单 =====
+        if song is None:
+            playlist = self._get_playlist(session_id)
+            current = playlist.current_song
+            if current:
+                song = current.song
+                elapsed = current.playback_seconds
+                has_progress = current.started_at > 0
+                source_desc = f"来源: 插件歌单 (由 {current.added_by_name} 点歌)"
+                lines.append("当前插件歌单正在播放的歌曲:")
+
+                # 歌单位置
+                pos = playlist.current_index + 1
+                total = len(playlist.entries)
+                lines.append(f"歌单位置: 第{pos}首/共{total}首")
+                if playlist.current_index < total - 1:
+                    next_entry = playlist.entries[playlist.current_index + 1]
+                    lines.append(f"下一首: {next_entry.song.title} - {next_entry.song.artist}")
+
+        if song is None:
+            if not cookie:
+                return "当前没有播放信息。用户还没有点歌，也没有绑定网易云账号。可以使用 /绑定网易云 <cookie> 绑定账号后，AI就能感知用户在网易云听的歌了。"
+            return "当前没有播放信息。用户没有在插件中点歌，网易云也没有最近的播放记录。"
+
+        # ===== 歌曲基本信息 =====
+        lines.append(f"歌名: {song.title}")
+        lines.append(f"歌手: {song.artist}")
         if song.album:
             lines.append(f"专辑: {song.album}")
         if song.duration > 0:
             m, s = divmod(song.duration, 60)
             lines.append(f"总时长: {m}分{s:02d}秒")
-        lines.append(f"来源: {src_map.get(song.source, song.source)}")
-        lines.append(f"点歌人: {current.added_by_name}")
+        lines.append(source_desc)
 
-        # 播放进度信息
-        elapsed = current.playback_seconds
-        if current.started_at > 0:
+        # ===== 播放进度 =====
+        if has_progress:
             em, es = divmod(int(elapsed), 60)
             if song.duration > 0:
                 dm, ds = divmod(song.duration, 60)
                 progress_pct = min(100, int(elapsed / song.duration * 100))
                 lines.append(f"播放进度: {em}:{es:02d} / {dm}:{ds:02d} ({progress_pct}%)")
-                if current.is_finished:
-                    lines.append("状态: 已播放完毕")
+                if elapsed >= song.duration:
+                    lines.append("状态: 可能已播放完毕或在循环播放")
                 else:
                     lines.append("状态: 正在播放中")
             else:
-                lines.append(f"已播放: {em}:{es:02d}")
-                lines.append("状态: 正在播放中")
-        else:
-            lines.append("状态: 已添加到歌单，尚未开始播放")
+                lines.append(f"已播放约: {em}:{es:02d}")
 
-        # 歌单位置信息
-        pos = playlist.current_index + 1
-        total = len(playlist.entries)
-        lines.append(f"歌单位置: 第{pos}首/共{total}首")
-
-        if playlist.current_index < total - 1:
-            next_entry = playlist.entries[playlist.current_index + 1]
-            lines.append(f"下一首: {next_entry.song.title} - {next_entry.song.artist}")
-
-        # 获取歌词并定位到当前播放位置
+        # ===== 歌词定位 =====
         try:
             lyric_raw = await self.music_api.get_lyric(song)
             if lyric_raw:
                 parsed_lrc = MusicAPI.parse_lrc(lyric_raw)
-                if parsed_lrc and current.started_at > 0:
-                    # 有时间标签的歌词，精确定位当前行
+                if parsed_lrc and has_progress:
                     lyric_info = MusicAPI.get_lyric_at_position(parsed_lrc, elapsed, context=3)
                     if lyric_info["current_line"]:
                         lines.append(f"\n当前正在唱的歌词: 「{lyric_info['current_line']}」")
                         lines.append(f"\n歌词上下文 (>> 标记当前行):")
                         lines.append(lyric_info["progress_text"])
                 elif parsed_lrc:
-                    # 有歌词但没有播放进度，显示开头
                     lines.append(f"\n歌词开头:")
                     for _, text in parsed_lrc[:6]:
                         lines.append(f"  {text}")
                 else:
-                    # 没有时间标签的纯文本歌词
                     plain_lines = [l.strip() for l in lyric_raw.split("\n") if l.strip()]
                     if plain_lines:
                         lines.append(f"\n歌词片段:")
@@ -1016,17 +1154,19 @@ class MusicTogetherPlugin(Star):
     @filter.llm_tool()
     async def get_netease_recent_plays(self, event: AstrMessageEvent):
         """当用户提到自己在网易云音乐上听了什么、最近在听什么歌、或者想知道自己网易云的播放记录时调用此工具。
-        获取用户在网易云音乐上的真实最近播放记录（需要配置网易云cookie）。
+        获取用户在网易云音乐上的真实最近播放记录（需要用户绑定网易云cookie）。
         """
-        recent = await self.music_api.get_recent_songs(limit=10)
+        user_id = event.get_sender_id() or ""
+        cookie = await self._get_user_cookie(user_id)
+
+        recent = await self.music_api.get_recent_songs(limit=10, cookie=cookie)
         if not recent:
-            if not self.music_api.netease_cookie:
-                return "未配置网易云音乐登录cookie，无法获取真实播放记录。请在插件配置中填写 netease_cookie。"
+            if not cookie:
+                return "用户未绑定网易云账号，无法获取播放记录。请使用 /绑定网易云 <cookie> 绑定后即可。"
             return "获取网易云最近播放记录失败，可能是cookie已过期或网络问题。"
 
         # 缓存搜索结果以便用户可以选歌
         session_id = event.unified_msg_origin or ""
-        user_id = event.get_sender_id() or ""
         if session_id not in _search_cache:
             _search_cache[session_id] = {}
         _search_cache[session_id][user_id] = [item["song"] for item in recent]

@@ -181,6 +181,7 @@ class UserData:
     favorites: list = field(default_factory=list)  # List[dict] (Song.to_dict)
     play_history: list = field(default_factory=list)  # List[dict]
     play_count: dict = field(default_factory=dict)  # {source_songid: count}
+    netease_cookie: str = ""  # 用户绑定的网易云cookie
 
     def add_favorite(self, song: Song) -> bool:
         key = f"{song.source}_{song.song_id}"
@@ -224,6 +225,7 @@ class UserData:
             "favorites": self.favorites,
             "play_history": self.play_history,
             "play_count": self.play_count,
+            "netease_cookie": self.netease_cookie,
         }
 
     @classmethod
@@ -233,4 +235,5 @@ class UserData:
             favorites=data.get("favorites", []),
             play_history=data.get("play_history", []),
             play_count=data.get("play_count", {}),
+            netease_cookie=data.get("netease_cookie", ""),
         )

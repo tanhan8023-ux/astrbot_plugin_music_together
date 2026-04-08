@@ -462,19 +462,24 @@ class MusicAPI:
     #  网易云用户最近播放记录
     # ================================================================
 
-    async def get_recent_songs(self, limit: int = 10) -> List[dict]:
-        """获取网易云用户最近播放的歌曲 (需要登录cookie)
+    async def get_recent_songs(self, limit: int = 10, cookie: str = "") -> List[dict]:
+        """获取网易云用户最近播放的歌曲
 
-        返回 List[dict]，每项包含 song (Song对象) 和 playTime (播放时间戳ms)
+        Args:
+            limit: 返回数量
+            cookie: 用户的网易云cookie，为空则使用全局配置的cookie
+
+        返回 List[dict]，每项包含 song (Song对象) 和 play_time (播放时间戳ms)
         """
-        if not self.netease_cookie:
+        use_cookie = cookie or self.netease_cookie
+        if not use_cookie:
             logger.debug("未配置cookie，无法获取最近播放记录")
             return []
         results = []
         try:
             session = await self._get_session()
             url = f"{self.netease_api}/record/recent/song"
-            params = {"limit": limit, **self._netease_params()}
+            params = {"limit": limit, "cookie": use_cookie}
             async with session.get(url, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
