@@ -16,5 +16,5 @@ help: |
   /音乐榜 - 查看热门排行榜
   /听歌帮助 - 查看详细帮助
 version: "1.0.0"
-author: user
-repo: ""
+author: tanhan8023-ux
+repo: "https://github.com/tanhan8023-ux/astrbot_plugin_music_together"
