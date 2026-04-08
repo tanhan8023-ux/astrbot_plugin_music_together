@@ -589,28 +589,45 @@ class MusicTogetherPlugin(Star):
     @filter.command("绑定网易云", alias={"bind_netease", "绑定cookie"})
     async def cmd_bind_netease(self, event: AstrMessageEvent):
         """绑定网易云音乐账号cookie，绑定后AI可以感知你在网易云听的歌"""
-        cookie = event.message_str.strip()
+        # 从消息中提取cookie：尝试多种方式获取
+        cookie = event.message_str.strip() if event.message_str else ""
+
         if not cookie:
             yield event.plain_result(
-                "请提供你的网易云cookie，例如:\n"
-                "/绑定网易云 MUSIC_U=xxxx\n"
+                "请提供你的网易云cookie，格式:\n"
+                "/绑定网易云 你的MUSIC_U值\n"
                 "\n"
                 "获取方式:\n"
                 "1. 浏览器登录 music.163.com\n"
-                "2. F12打开开发者工具 -> Application -> Cookies\n"
-                "3. 复制 MUSIC_U 的值\n"
+                "2. F12 -> Application -> Cookies\n"
+                "3. 找到 MUSIC_U，复制它的值\n"
                 "\n"
-                "绑定后AI就能知道你在网易云正在听什么歌了！\n"
-                "建议私聊发送cookie，避免泄露。"
+                "绑定后AI就能知道你在网易云听什么歌了！\n"
+                "建议私聊发送，避免泄露。"
             )
             return
 
         user_id = event.get_sender_id() or ""
 
+        # 清理cookie：去掉可能残留的命令名
+        for prefix in ["绑定网易云", "bind_netease", "绑定cookie"]:
+            if cookie.startswith(prefix):
+                cookie = cookie[len(prefix):].strip()
+
+        if not cookie:
+            yield event.plain_result("cookie不能为空，请在命令后面粘贴你的MUSIC_U值。")
+            return
+
         # 自动补全cookie格式
-        if not cookie.startswith("MUSIC_U=") and "MUSIC_U" not in cookie and "=" not in cookie:
-            # 用户可能只粘贴了 MUSIC_U 的值
+        if "MUSIC_U" not in cookie:
             cookie = f"MUSIC_U={cookie}"
+        # 如果用户粘贴了完整的cookie字符串（含多个字段），提取MUSIC_U部分
+        if ";" in cookie:
+            for part in cookie.split(";"):
+                part = part.strip()
+                if part.startswith("MUSIC_U="):
+                    cookie = part
+                    break
 
         user_data = self._get_user(user_id)
         user_data.netease_cookie = cookie
@@ -618,21 +635,26 @@ class MusicTogetherPlugin(Star):
 
         # 验证cookie是否有效
         yield event.plain_result("正在验证cookie...")
-        recent = await self.music_api.get_recent_songs(limit=1, cookie=cookie)
+        try:
+            recent = await self.music_api.get_recent_songs(limit=1, cookie=cookie)
+        except Exception as e:
+            logger.warning(f"验证cookie时出错: {e}")
+            recent = []
+
         if recent:
             song = recent[0]["song"]
             yield event.plain_result(
-                f"绑定成功！cookie验证有效。\n"
-                f"你最近听的歌: {song.title} - {song.artist}\n"
+                f"绑定成功！\n"
+                f"你最近听的: {song.title} - {song.artist}\n"
                 f"\n现在AI可以感知你在网易云听的歌了~"
             )
         else:
             yield event.plain_result(
-                "已保存cookie，但验证未通过。可能的原因:\n"
-                "1. cookie格式不对 (需要 MUSIC_U 的值)\n"
-                "2. cookie已过期 (需要重新登录获取)\n"
-                "3. NeteaseCloudMusicApi 服务未启动\n"
-                "\n请检查后重新绑定: /绑定网易云 <cookie>"
+                "已保存cookie，但验证未通过。可能原因:\n"
+                "1. MUSIC_U值不对 (确认复制完整)\n"
+                "2. cookie已过期 (重新登录获取)\n"
+                "3. NeteaseCloudMusicApi 未启动\n"
+                "\n可用 /音乐状态 检查API连接"
             )
 
     @filter.command("解绑网易云", alias={"unbind_netease", "解绑cookie"})
