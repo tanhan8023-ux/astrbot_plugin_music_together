@@ -3,6 +3,7 @@
 支持多平台点歌、共享歌单、互动投票、音乐推荐与讨论
 """
 import os
+import time as _time
 import logging
 import random
 import datetime
@@ -605,23 +606,33 @@ class MusicTogetherPlugin(Star):
             return
 
         user_id = event.get_sender_id() or ""
+
+        # 自动补全cookie格式
+        if not cookie.startswith("MUSIC_U=") and "MUSIC_U" not in cookie and "=" not in cookie:
+            # 用户可能只粘贴了 MUSIC_U 的值
+            cookie = f"MUSIC_U={cookie}"
+
         user_data = self._get_user(user_id)
         user_data.netease_cookie = cookie
         self._save_user(user_data)
 
         # 验证cookie是否有效
+        yield event.plain_result("正在验证cookie...")
         recent = await self.music_api.get_recent_songs(limit=1, cookie=cookie)
         if recent:
             song = recent[0]["song"]
             yield event.plain_result(
-                f"绑定成功！已验证cookie有效。\n"
+                f"绑定成功！cookie验证有效。\n"
                 f"你最近听的歌: {song.title} - {song.artist}\n"
                 f"\n现在AI可以感知你在网易云听的歌了~"
             )
         else:
             yield event.plain_result(
-                "已保存cookie，但无法验证是否有效（可能是cookie格式问题或API未连接）。\n"
-                "如果不生效，请检查cookie是否正确。"
+                "已保存cookie，但验证未通过。可能的原因:\n"
+                "1. cookie格式不对 (需要 MUSIC_U 的值)\n"
+                "2. cookie已过期 (需要重新登录获取)\n"
+                "3. NeteaseCloudMusicApi 服务未启动\n"
+                "\n请检查后重新绑定: /绑定网易云 <cookie>"
             )
 
     @filter.command("解绑网易云", alias={"unbind_netease", "解绑cookie"})
@@ -921,40 +932,60 @@ class MusicTogetherPlugin(Star):
         """从网易云拉取用户最近播放的第一首歌，作为"当前在听的歌"
 
         Returns:
-            dict: {"song": Song, "play_time": int(ms), "elapsed_estimate": float(秒)} 或空dict
+            dict: {"song": Song, "play_time": int(ms), "elapsed_estimate": float(秒),
+                   "is_stale": bool, "elapsed_since_record": float(秒)} 或空dict
         """
         if not cookie:
             return {}
         try:
-            recent = await self.music_api.get_recent_songs(limit=1, cookie=cookie)
+            recent = await self.music_api.get_recent_songs(limit=3, cookie=cookie)
             if not recent:
+                logger.debug("网易云最近播放返回空列表")
                 return {}
             item = recent[0]
             song = item["song"]
             play_time_ms = item.get("play_time", 0)
-            # 估算已播放时间：当前时间 - 播放记录时间
+
+            logger.debug(f"网易云最近播放: {song.title} - {song.artist}, playTime={play_time_ms}, duration={song.duration}s")
+
             if play_time_ms > 0:
-                import time as _time
-                elapsed = _time.time() - play_time_ms / 1000.0
-                # 如果超过歌曲时长的2倍，说明这首歌早就听完了，不算"正在听"
-                if song.duration > 0 and elapsed > song.duration * 2:
-                    return {
-                        "song": song,
-                        "play_time": play_time_ms,
-                        "elapsed_estimate": song.duration,  # 已听完
-                        "is_stale": True,
-                    }
-                # 如果在合理范围内，估算当前进度
-                elapsed_in_song = min(elapsed, song.duration) if song.duration > 0 else elapsed
+                now = _time.time()
+                elapsed_since_record = now - play_time_ms / 1000.0
+
+                # 10分钟内的记录都认为是"可能正在听"
+                # 因为网易云API有延迟，而且用户可能在循环播放
+                is_stale = elapsed_since_record > 600  # 超过10分钟算过期
+
+                # 估算歌曲内的播放位置
+                if song.duration > 0:
+                    if elapsed_since_record <= 0:
+                        elapsed_in_song = 0.0
+                    elif elapsed_since_record <= song.duration:
+                        # 还在第一遍播放中
+                        elapsed_in_song = elapsed_since_record
+                    else:
+                        # 可能在循环播放，取模
+                        elapsed_in_song = elapsed_since_record % song.duration
+                else:
+                    elapsed_in_song = elapsed_since_record
+
                 return {
                     "song": song,
                     "play_time": play_time_ms,
                     "elapsed_estimate": max(0, elapsed_in_song),
-                    "is_stale": False,
+                    "elapsed_since_record": elapsed_since_record,
+                    "is_stale": is_stale,
                 }
-            return {"song": song, "play_time": 0, "elapsed_estimate": 0, "is_stale": True}
+            # 没有播放时间，但有歌曲信息，也返回（标记为stale但仍然有用）
+            return {
+                "song": song,
+                "play_time": 0,
+                "elapsed_estimate": 0,
+                "elapsed_since_record": 0,
+                "is_stale": True,
+            }
         except Exception as e:
-            logger.debug(f"拉取网易云最近播放失败: {e}")
+            logger.warning(f"拉取网易云最近播放失败: {e}")
             return {}
 
     @filter.llm_tool()
@@ -975,30 +1006,31 @@ class MusicTogetherPlugin(Star):
 
         # ===== 优先尝试从网易云获取真实播放状态 =====
         netease_info = await self._fetch_netease_now_playing(cookie)
-        if netease_info and not netease_info.get("is_stale", True):
+        if netease_info and netease_info.get("song"):
+            is_stale = netease_info.get("is_stale", True)
             song = netease_info["song"]
-            elapsed = netease_info["elapsed_estimate"]
-            has_progress = True
-            source_desc = "来源: 网易云音乐 (真实播放)"
+            elapsed = netease_info.get("elapsed_estimate", 0)
+            has_progress = not is_stale and elapsed > 0
+            elapsed_since = netease_info.get("elapsed_since_record", 0)
 
-            play_time_ms = netease_info.get("play_time", 0)
-            if play_time_ms:
-                dt = datetime.datetime.fromtimestamp(play_time_ms / 1000)
-                source_desc += f"\n开始播放时间: {dt.strftime('%H:%M:%S')}"
-
-            lines.append("用户当前真实正在听的歌曲 (来自网易云音乐):")
-        elif netease_info and netease_info.get("is_stale"):
-            # 有记录但已过期，作为补充信息
-            stale_song = netease_info["song"]
             play_time_ms = netease_info.get("play_time", 0)
             time_str = ""
             if play_time_ms:
                 dt = datetime.datetime.fromtimestamp(play_time_ms / 1000)
-                time_str = f" (播放于 {dt.strftime('%m-%d %H:%M')})"
-            lines.append(f"用户最近在网易云听过: {stale_song.title} - {stale_song.artist}{time_str}")
-            lines.append("")
+                time_str = dt.strftime('%H:%M:%S')
 
-        # ===== 如果网易云没有实时数据，回退到插件歌单 =====
+            if not is_stale:
+                source_desc = f"来源: 网易云音乐 (真实播放)"
+                if time_str:
+                    source_desc += f"\n开始播放时间: {time_str}"
+                lines.append("用户当前真实正在听的歌曲 (来自网易云音乐):")
+            else:
+                # 超过10分钟，但仍然是最近听的歌，告诉AI
+                ago_min = int(elapsed_since / 60)
+                source_desc = f"来源: 网易云音乐 (约{ago_min}分钟前播放)"
+                lines.append(f"用户最近在网易云听的歌 (约{ago_min}分钟前):")
+
+        # ===== 如果网易云完全没数据，回退到插件歌单 =====
         if song is None:
             playlist = self._get_playlist(session_id)
             current = playlist.current_song
@@ -1020,7 +1052,7 @@ class MusicTogetherPlugin(Star):
         if song is None:
             if not cookie:
                 return "当前没有播放信息。用户还没有点歌，也没有绑定网易云账号。可以使用 /绑定网易云 <cookie> 绑定账号后，AI就能感知用户在网易云听的歌了。"
-            return "当前没有播放信息。用户没有在插件中点歌，网易云也没有最近的播放记录。"
+            return "当前没有播放信息。用户没有在插件中点歌，网易云也没有最近的播放记录。可能cookie已过期，建议用 /绑定网易云 重新绑定。"
 
         # ===== 歌曲基本信息 =====
         lines.append(f"歌名: {song.title}")

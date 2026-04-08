@@ -479,10 +479,20 @@ class MusicAPI:
         try:
             session = await self._get_session()
             url = f"{self.netease_api}/record/recent/song"
+            # cookie 同时通过 query param 和 header 传递，兼容不同版本的 NeteaseCloudMusicApi
             params = {"limit": limit, "cookie": use_cookie}
-            async with session.get(url, params=params) as resp:
+            headers = {}
+            # 如果 cookie 看起来像标准 cookie 格式 (含 MUSIC_U)，也放到 header 里
+            if "MUSIC_U" in use_cookie or "=" in use_cookie:
+                cookie_header = use_cookie
+                # 如果用户只传了 MUSIC_U=xxx，补全格式
+                if not cookie_header.startswith("MUSIC_U=") and "MUSIC_U" not in cookie_header:
+                    cookie_header = f"MUSIC_U={cookie_header}"
+                headers["Cookie"] = cookie_header
+            async with session.get(url, params=params, headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    logger.debug(f"最近播放API返回code: {data.get('code')}, 数据条数: {len(data.get('data', {}).get('list', []))}")
                     if data.get("code") == 200:
                         for item in data.get("data", {}).get("list", [])[:limit]:
                             song_data = item.get("data", {})
@@ -499,10 +509,21 @@ class MusicAPI:
                                 source="netease",
                                 cover_url=album_info.get("picUrl", ""),
                             )
+                            # playTime 是毫秒时间戳
+                            play_time = item.get("playTime", 0)
+                            # 有些版本的API字段名不同，兼容处理
+                            if not play_time:
+                                play_time = item.get("time", 0)
                             results.append({
                                 "song": song,
-                                "play_time": item.get("playTime", 0),
+                                "play_time": play_time,
                             })
+                    elif data.get("code") == 301:
+                        logger.warning("网易云cookie无效或已过期 (code=301)，请重新绑定")
+                    else:
+                        logger.warning(f"获取最近播放返回异常code: {data.get('code')}, msg: {data.get('msg', '')}")
+                else:
+                    logger.warning(f"获取最近播放HTTP状态码: {resp.status}")
         except aiohttp.ClientConnectorError:
             logger.error("无法连接 NeteaseCloudMusicApi，获取最近播放失败")
         except Exception as e:
